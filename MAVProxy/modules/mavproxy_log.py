@@ -8,7 +8,7 @@ from MAVProxy.modules.lib import mp_module
 class LogModule(mp_module.MPModule):
     def __init__(self, mpstate):
         super(LogModule, self).__init__(mpstate, "log", "log transfer")
-        self.add_command('log', self.cmd_log, "log file handling", ['<download|status|erase|resume|cancel|list>'])
+        self.add_command('log', self.cmd_log, "log file handling", ['<download|status|erase|dump|resume|cancel|list>'])
         self.reset()
 
     def reset(self):
@@ -23,6 +23,12 @@ class LogModule(mp_module.MPModule):
         self.entries = {}
         self.download_queue = []
         self.last_status = time.time()
+        self.sched_rate = 50
+        self.fc_ready = False
+        self.dump_active = False
+        self.dump_stage = 0
+        self.num_logs = -1
+        self.reboot_req = False
 
     def mavlink_packet(self, m):
         '''handle an incoming mavlink packet'''
@@ -30,6 +36,10 @@ class LogModule(mp_module.MPModule):
             self.handle_log_entry(m)
         elif m.get_type() == 'LOG_DATA':
             self.handle_log_data(m)
+        elif m.get_type() == 'STATUSTEXT':
+            status_str = str(m.text)
+            if 'PreArm: Waiting for RC' in status_str:
+                self.fc_ready = True
 
     def handle_log_entry(self, m):
         '''handling incoming log entry'''
@@ -37,6 +47,7 @@ class LogModule(mp_module.MPModule):
             tstring = ''
         else:
             tstring = time.ctime(m.time_utc)
+        self.num_logs = m.num_logs
         if m.num_logs == 0:
             print("No logs")
             return
@@ -73,6 +84,7 @@ class LogModule(mp_module.MPModule):
                                                                                                    self.retries)
             self.console.set_status('LogDownload',status, row=4)
             print(status)
+            print(len(self.download_queue))
             self.download_file = None
             self.download_filename = None
             self.download_set = set()
@@ -142,6 +154,7 @@ class LogModule(mp_module.MPModule):
                                                                                             len(diff))
         if console:
             self.console.set_status('LogDownload', status, row=4)
+            print(status)
         else:
             print(status)
 
@@ -194,30 +207,118 @@ class LogModule(mp_module.MPModule):
     def default_log_filename(self, log_num):
         return "log%u.bin" % log_num
 
+    def log_list(self):
+        print("Requesting log list")
+        self.download_set = set()
+        self.master.mav.log_request_list_send(self.target_system,
+                                                   self.target_component,
+                                                   0, 0xffff)
+
+    def cmd_dump(self):
+        '''dump all the logs and erase them from FC'''
+        print("Log dump started")
+        self.fc_ready = False
+        self.num_logs = -1
+        self.dump_stage = 1
+
+    def set_sched_rate(self, rate):
+        param = 'SCHED_LOOP_RATE'
+        self.sched_rate = int(self.get_mav_param(param))
+        print(f"Scheduler rate {self.sched_rate}Hz")
+        if self.sched_rate != rate:
+            self.param_set(param, rate)
+            new_sched_rate = int(self.get_mav_param(param))
+            print(f"Scheduler rate set to {new_sched_rate}Hz (was {self.sched_rate}Hz)")
+            self.reboot_req = True
+
+    def handle_dump_stage(self):
+        if self.dump_active:
+            return
+        
+        self.dump_active = True
+        match self.dump_stage:
+            case 1: # ready?
+                if self.fc_ready:
+                    print(">Requesting log number")
+                    self.num_logs = -1
+                    self.log_list() # request log number
+                    self.dump_stage = 2
+            case 2: # wait for log number
+                if self.num_logs > 0:
+                    if self.num_logs == 0:
+                        print(">No logs available")
+                        self.dump_stage = 0
+                    else: # request scheduler
+                        self.set_sched_rate(300)
+                        self.dump_stage = 3
+            case 3: # reboot if needed
+                if self.reboot_req:
+                    print("Rebooting to apply scheduler rate")
+                    self.master.reboot_autopilot() 
+                    self.fc_ready = False
+                self.dump_stage = 4
+            case 4: # wait for fc to be ready and request log number
+                if self.fc_ready:
+                    print(">Requesting log number again")
+                    self.num_logs = -1
+                    self.log_list() # request log number
+                    self.dump_stage = 5
+            case 5: # wait for log number and start downloading
+                if self.num_logs > 0:
+                    print("Downloading the logs")
+                    self.log_download_all()
+                    self.dump_stage = 6
+                elif self.num_logs == 0:
+                    print(">No logs available")
+                    self.dump_stage = 0
+            case 6: # wait for download to finish
+                if self.download_filename is None and len(self.download_queue) == 0:
+                    print("All logs downloaded successfully")
+                    self.dump_stage = 7
+            case 7: # revert the scheduler to the previous rate
+                # self.sched_rate = max(50, self.sched_rate)
+                if self.reboot_req:
+                    self.set_sched_rate(self.sched_rate)
+                self.dump_stage = 8
+            case 8: # save params
+                print("Saving parameters")
+                self.mpstate.functions.process_stdin('param save after_flight.param')
+                self.dump_stage = 9
+            case 9: # erase the chip
+                self.master.mav.log_erase_send(self.target_system, self.target_component)
+                print("Log erase initiated. Allow 30s to complete")
+                self.dump_stage = 0
+            # case 10: # reboot if needed - don't do it - eeprom is not yet cleared
+            #     if self.reboot_req:
+            #         print("Rebooting to apply scheduler rate")
+            #         self.master.reboot_autopilot() 
+            #         self.fc_ready = False
+            #     self.dump_stage = 0
+        self.dump_active = False
+
     def cmd_log(self, args):
         '''log commands'''
-        usage = "usage: log <list|download|erase|resume|status|cancel>"
+        usage = "usage: log <list|download|erase|dump|resume|status|cancel>"
         if len(args) < 1:
             print(usage)
             return
 
         if args[0] == "status":
             self.log_status()
+            
         elif args[0] == "list":
-            print("Requesting log list")
-            self.download_set = set()
-            self.master.mav.log_request_list_send(self.target_system,
-                                                       self.target_component,
-                                                       0, 0xffff)
+            self.log_list()
 
         elif args[0] == "erase":
             self.master.mav.log_erase_send(self.target_system,
                                                 self.target_component)
+        elif args[0] == "dump":
+            self.cmd_dump()
 
         elif args[0] == "resume":
             self.master.mav.log_request_end_send(self.target_system,
                                                       self.target_component)
-
+            
         elif args[0] == "cancel":
             if self.download_file is not None:
                 self.download_file.close()
@@ -256,7 +357,6 @@ class LogModule(mp_module.MPModule):
         else:
             print(usage)
 
-
     def update_status(self):
         '''update log download status in console'''
         now = time.time()
@@ -270,6 +370,8 @@ class LogModule(mp_module.MPModule):
             self.download_last_timestamp = time.time()
             self.handle_log_data_missing()
         self.update_status()
+        self.handle_dump_stage()
+            
 
 def init(mpstate):
     '''initialise module'''
